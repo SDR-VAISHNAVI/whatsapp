@@ -86,6 +86,7 @@ async function saveSession(ownerId) {
             try { files[file] = JSON.parse(raw); } catch { files[file] = raw; }
         }
         const { error } = await supabase.from('whatsapp_sessions').upsert({
+            id:         String(ownerId),
             owner_id:   ownerId,
             session:    JSON.stringify(files),
             status:     'active',
@@ -108,10 +109,12 @@ async function markLoggedOut(ownerId) {
     const dir = sessionDir(ownerId);
     if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
     try {
-        const { error } = await supabase.from('whatsapp_sessions').update({
+        const { error } = await supabase.from('whatsapp_sessions').upsert({
+            id:         String(ownerId),
+            owner_id:   ownerId,
             status:     'logged_out',
             updated_at: new Date().toISOString()
-        }).eq('owner_id', ownerId);
+        }, { onConflict: 'owner_id' });
         if (error) throw error;
         console.log(`marked logged_out for owner ${ownerId}`);
     } catch (e) {
@@ -151,10 +154,12 @@ async function connectWhatsApp(ownerId) {
 
         const sock = makeWASocket({
             version,
-            auth:              authState,
-            printQRInTerminal: true,
-            logger:            pino({ level: 'warn' }),
-            browser:           ['BeltBook', 'Chrome', '120.0.0'],
+            auth:                authState,
+            printQRInTerminal:   false,
+            logger:              pino({ level: 'warn' }),
+            browser:             ['BeltBook', 'Chrome', '120.0.0'],
+            syncFullHistory:     false,
+            markOnlineOnConnect: false,
         });
 
         state.sock = sock;
@@ -229,10 +234,12 @@ async function connectWhatsAppPairing(ownerId, phoneNumber) {
 
         const sock = makeWASocket({
             version,
-            auth:              authState,
-            printQRInTerminal: false,
-            logger:            pino({ level: 'warn' }),
-            browser:           ['BeltBook', 'Chrome', '120.0.0'],
+            auth:                authState,
+            printQRInTerminal:   false,
+            logger:              pino({ level: 'warn' }),
+            browser:             ['BeltBook', 'Chrome', '120.0.0'],
+            syncFullHistory:     false,
+            markOnlineOnConnect: false,
         });
 
         state.sock = sock;
