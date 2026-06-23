@@ -86,7 +86,6 @@ async function saveSession(ownerId) {
             try { files[file] = JSON.parse(raw); } catch { files[file] = raw; }
         }
         const { error } = await supabase.from('whatsapp_sessions').upsert({
-            id:         String(ownerId),
             owner_id:   ownerId,
             session:    JSON.stringify(files),
             status:     'active',
@@ -109,12 +108,10 @@ async function markLoggedOut(ownerId) {
     const dir = sessionDir(ownerId);
     if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
     try {
-        const { error } = await supabase.from('whatsapp_sessions').upsert({
-            id:         String(ownerId),
-            owner_id:   ownerId,
+        const { error } = await supabase.from('whatsapp_sessions').update({
             status:     'logged_out',
             updated_at: new Date().toISOString()
-        }, { onConflict: 'owner_id' });
+        }).eq('owner_id', ownerId);
         if (error) throw error;
         console.log(`marked logged_out for owner ${ownerId}`);
     } catch (e) {
@@ -154,12 +151,10 @@ async function connectWhatsApp(ownerId) {
 
         const sock = makeWASocket({
             version,
-            auth:                authState,
-            printQRInTerminal:   false,
-            logger:              pino({ level: 'warn' }),
-            browser:             ['BeltBook', 'Chrome', '120.0.0'],
-            syncFullHistory:     false,
-            markOnlineOnConnect: false,
+            auth:              authState,
+            printQRInTerminal: true,
+            logger:            pino({ level: 'warn' }),
+            browser:           ['BeltBook', 'Chrome', '120.0.0'],
         });
 
         state.sock = sock;
@@ -219,87 +214,6 @@ function parseOwnerId(value) {
     return id;
 }
 
-// ── Pairing-code connect (no QR needed) ──────────────
-async function connectWhatsAppPairing(ownerId, phoneNumber) {
-    const state = getState(ownerId);
-    if (state.connecting) return;
-    state.connecting = true;
-
-    try {
-        await loadSession(ownerId);
-        const dir = ensureSessionDir(ownerId);
-
-        const { state: authState, saveCreds } = await useMultiFileAuthState(dir);
-        const { version } = await fetchLatestBaileysVersion();
-
-        const sock = makeWASocket({
-            version,
-            auth:                authState,
-            printQRInTerminal:   false,
-            logger:              pino({ level: 'warn' }),
-            browser:             ['BeltBook', 'Chrome', '120.0.0'],
-            syncFullHistory:     false,
-            markOnlineOnConnect: false,
-        });
-
-        state.sock = sock;
-
-        sock.ev.on('creds.update', async () => {
-            await saveCreds();
-            await saveSession(ownerId);
-        });
-
-        sock.ev.on('connection.update', async (update) => {
-            const { connection, lastDisconnect } = update;
-
-            if (connection === 'open') {
-                state.ready       = true;
-                state.connecting  = false;
-                state.pairingCode = null;
-                await saveSession(ownerId);
-                console.log(`✅ connected (pairing) for owner ${ownerId}`);
-            }
-
-            if (connection === 'close') {
-                state.ready      = false;
-                state.connecting = false;
-                const code = lastDisconnect?.error instanceof Boom
-                    ? lastDisconnect.error.output?.statusCode : null;
-                const reconnect = code !== DisconnectReason.loggedOut;
-                console.log(`closed (pairing) for owner ${ownerId} (${code}). reconnect=${reconnect}`);
-                if (reconnect) {
-                    setTimeout(() => connectWhatsApp(ownerId), 5000);
-                } else {
-                    await markLoggedOut(ownerId);
-                    state.sock = null;
-                    setTimeout(() => connectWhatsApp(ownerId), 5000);
-                }
-            }
-        });
-
-        // Request pairing code after socket is ready
-        if (!authState.creds.registered) {
-            await new Promise(r => setTimeout(r, 2000));
-            try {
-                const code = await sock.requestPairingCode(phoneNumber);
-                state.pairingCode = code;
-                console.log(`pairing code for owner ${ownerId}: ${code}`);
-            } catch (e) {
-                console.error(`pairing code error (owner ${ownerId}):`, e.message);
-                state.connecting = false;
-            }
-        } else {
-            // Already registered, just connecting normally
-            state.connecting = false;
-        }
-
-    } catch (err) {
-        console.error(`pairing connect error (owner ${ownerId}):`, err.message);
-        const state = getState(ownerId);
-        state.connecting = false;
-    }
-}
-
 // ── ROUTES ────────────────────────────────────────────────
 
 // Status check — called from Flask /api/whatsapp/status
@@ -308,7 +222,7 @@ app.get('/status', (req, res) => {
     const ownerId = parseOwnerId(req.query.owner_id);
     if (!ownerId) return res.status(400).json({ error: 'owner_id required' });
     const state = getState(ownerId);
-    res.json({ connected: state.ready, has_qr: !!state.qr, pairing_code: state.pairingCode || null });
+    res.json({ connected: state.ready, has_qr: !!state.qr });
 });
 
 // QR data — called from Flask /api/whatsapp/qr
@@ -321,36 +235,15 @@ app.get('/qr-data', (req, res) => {
     res.json({ connected: false, qr: state.qr });
 });
 
-// Connect (start session) — initiates pairing code flow
-app.post('/connect', async (req, res) => {
-    const ownerId     = parseOwnerId(req.body?.owner_id);
-    const phoneNumber = (req.body?.phone_number || '').replace(/[^0-9]/g, '');
-    if (!ownerId)     return res.status(400).json({ error: 'owner_id required' });
-    if (!phoneNumber) return res.status(400).json({ error: 'phone_number required' });
-
+// Connect (start session)
+app.post('/connect', (req, res) => {
+    const ownerId = parseOwnerId(req.body?.owner_id);
+    if (!ownerId) return res.status(400).json({ error: 'owner_id required' });
     const state = getState(ownerId);
-    // Reset any existing session so we get a fresh pairing code
-    if (state.sock) {
-        try { state.sock.end(); } catch {}
-        state.sock = null;
+    if (!state.ready && !state.connecting) {
+        connectWhatsApp(ownerId);
     }
-    state.ready      = false;
-    state.qr         = null;
-    state.pairingCode = null;
-    state.connecting  = false;
-
-    await connectWhatsAppPairing(ownerId, phoneNumber);
-    // Wait up to 8s for pairing code to be generated
-    for (let i = 0; i < 16; i++) {
-        if (getState(ownerId).pairingCode) break;
-        await new Promise(r => setTimeout(r, 500));
-    }
-    const code = getState(ownerId).pairingCode;
-    if (code) {
-        res.json({ started: true, pairing_code: code });
-    } else {
-        res.status(504).json({ error: 'Pairing code not generated yet. Try again.' });
-    }
+    res.json({ started: true });
 });
 
 // Logout (clear session)
